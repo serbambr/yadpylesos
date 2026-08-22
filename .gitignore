@@ -1,0 +1,38 @@
+# Секреты и авторизация
+auth/
+.env
+
+# Базы данных и кэши
+db/
+cache/
+.ruff_cache/
+
+# Логи и отчеты
+report/
+.lock
+.pid
+yadpylesos.lock
+
+# Бекапы и тесты
+*.bak
+*.part
+*.corrupt
+*.tmp
+__pycache__/
+backup/
+testing/
+
+# Источник ссылок
+source_links.txt
+!source_links.txt.example
+
+yadpylesos
+
+# VPN (R&D)
+vpn/
+!vpn/link1.txt.example
+
+# Инструменты
+ADR/
+documention/TECHNIQUES.md
+documention/commands.md

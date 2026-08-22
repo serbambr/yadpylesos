@@ -1,0 +1,7 @@
+# False positives: Атрибуты библиотеки requests
+_.verify
+_.session_api.verify
+_.session_cdn.verify
+
+# Заглушки для будущих провайдеров
+MailAPIService

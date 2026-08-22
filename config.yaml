@@ -1,0 +1,6 @@
+paths:
+  db_dir: "/db"
+  report_dir: "/report"
+  download_dir: "/download"
+  auth_dir: "/auth"
+  vpn_dir: "/vpn"
