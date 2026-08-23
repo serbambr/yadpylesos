@@ -2,17 +2,30 @@
 # ==========================================
 # Проект: Я.Д-Пылесос / YA.D-Pylesos
 # Скрипт: yadpylesos.sh
-# Версия: 13.0
+# Версия: 13.1
 # ==========================================
 
 set -euo pipefail
 cd "$(dirname "$0")" || exit 1
+
+# Безопасное расширение PATH для cron
+export PATH=$PATH:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
+
+# Функция логирования для Bash (добавляет время и цвет, как в Python)
+bash_log() {
+    local color=$1
+    local msg=$2
+    local ts
+    # Получаем время из Docker-образа, используя TZ из .env. Если Docker недоступен - fallback на date
+    ts=$($DOCKER_CMD run --rm -e TZ="$TZ" "$DOCKER_IMG" python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))" 2>/dev/null || date '+%Y-%m-%d %H:%M:%S')
+    echo -e "${color}[${ts}] [INFO]${NC} ${msg}"
+}
 
 if docker info > /dev/null 2>&1; then
     DOCKER_CMD="docker"
@@ -42,6 +55,8 @@ if [ -f "$ENV_FILE" ]; then
     set -a
     . "$ENV_FILE"
     set +a
+    # Явно экспортируем часовой пояс для команды date в Bash
+    export TZ="${TZ:-Europe/Moscow}"
     # Формируем аргументы для проброса в контейнер
     ENV_ARGS=(--env-file "$ENV_FILE")
 fi
@@ -52,42 +67,45 @@ LOG_MAX_FILES="${LOG_MAX_FILES:-3}"
 LOG_OPTS="--log-opt max-size=${LOG_MAX_SIZE} --log-opt max-file=${LOG_MAX_FILES}"
 
 show_help() {
-    echo -e "============================================="
-    echo -e " Я.Д-Пылесос ${GREEN}v13.0${NC}"
+    echo -e "${CYAN}=============================================${NC}"
+    echo -e " Я.Д-Пылесос ${GREEN}v13.1${NC}"
     echo -e " Использование: ./yadpylesos '<Имя_контейнера>' '<Ссылка_Яндекс>' '<Папка_назначения>' [Опции]"
     echo -e " Или для пакетного режима: ./yadpylesos --batch"
-    echo ""
+    echo -e "${CYAN}=============================================${NC}"
     echo " АРГУМЕНТЫ:"
     echo "  <Имя_контейнера>      Уникальное имя для процесса."
     echo "  <Ссылка_Яндекс>       Ссылка на Яндекс.Диск."
     echo "  <Папка_назначения>    Локальный путь для сохранения файлов (напр. /path/to/download)."
-    echo ""
-    echo " ОПЦИИ (строго через знак =):"
     echo "  [Кол-во_файлов]       Ожидаемое количество файлов (для прогресс-бара)."
-    echo "  -v, --verbose         Подробное логирование."
+    echo -e "${CYAN}=============================================${NC}"
+    echo "  --batch               Интерактивный менеджер ссылок."
+    echo "  --batch-auto          Автоматический пакетный режим для cron."
     echo "  --refresh-cache       Принудительно обновить кэш дерева."
     echo "  --build-queue         Создать список для скачивания без самого скачивания."
+    echo -e "${CYAN}=============================================${NC}"
+    echo "  --threads=N           Потоки для одного файла (1-8)."
+    echo "  --quantity-files=N    Параллельное скачивание файлов (1-8)."
+    echo "  --move-extra='/путь/' Перенос осиротевших файлов в карантин."
+    echo "  --md5='имя_файла'     Проверить MD5 конкретного файла."
+    echo -e "${CYAN}=============================================${NC}"
+    echo "  --vpn                 Принудительно запускать VPN при старте."
     echo "  --auth-enable         Включить глобальную авторизацию (OAuth 2.0)."
     echo "  --auth-disable        Отключить глобальную авторизацию."
     echo "  --auth-status         Проверить статус авторизации (токен, куки)."
-    echo "  --vpn                 Принудительно запускать VPN при старте."
-    echo "  --homeostasis-off     Отключить гомеостаз."
-    echo "  --simulate-ban        Симулировать бан API (для теста VPN)."
     echo "  --ssl-off             Отключить проверку SSL-сертификатов."
-    echo "  --threads=N           Потоки для одного файла (1-8)."
-    echo "  --quantity-files=N    Параллельное скачивание файлов (1-8)."
-    echo "  --md5='имя_файла'     Проверить MD5 конкретного файла."
-    echo "  --move-extra='/путь/' Перенос осиротевших файлов в карантин."
-    echo "  --batch               Интерактивный менеджер ссылок."
-    echo "  --batch-auto          Автоматический пакетный режим для cron."
-    echo "  --db-stats            Статистика всех БД."
+    echo "  --homeostasis-off     Отключить гомеостаз (авто-снижение потоков)."
+    echo "  --simulate-ban        Симулировать бан API (для теста VPN)."
+    echo -e "${CYAN}=============================================${NC}"
+    echo "  --db-stats            Статистика всех БД (включая телеметрию)."
     echo "  --db-check            Проверка целостности всех БД."
     echo "  --vacuum              Сжатие и оптимизация всех баз данных (VACUUM)."
-    echo "  --trace-mem           Анализ количества потребляемой RAM."
+    echo -e "${CYAN}=============================================${NC}"
+    echo "  -v, --verbose         Подробное логирование."
     echo "  --trace-status        Вывод панели состояния (CPU, RAM, Диск, VPN) раз в 60 сек."
-    echo "  --notify-tg           Отправка уведомления в Телеграм после окончания работы скрипта."
+    echo "  --trace-mem           Анализ количества потребляемой RAM."
+    echo "  --notify-tg           Отправка уведомления в Телеграм после окончания работы."
     echo "  -h, --help            Помощь."
-    echo -e "============================================="
+    echo -e "${CYAN}=============================================${NC}"
 }
 
 ask_yes_no() {
@@ -184,16 +202,8 @@ cleanup() {
     local CNAME=$1
     if [ -z "$CNAME" ]; then return; fi
     if $DOCKER_CMD inspect -f '{{.State.Status}}' "$CNAME" 2>/dev/null | grep -qw "exited"; then
-        if [ "$AUTO_MODE" == "1" ] && [ "$BATCH_AUTO" == "0" ] && [ -n "$BATCH_CURRENT_NUM" ] && [ -n "$BATCH_TOTAL_NUM" ]; then
-            echo -e "${YELLOW}[INFO]${NC} Обработка ссылки $BATCH_CURRENT_NUM/$BATCH_TOTAL_NUM завершена. Сохранение логов $CNAME..."
-        else
-            echo -e "${YELLOW}[INFO]${NC} Сохранение логов $CNAME..."
-        fi
-        local i=1
-        while [ -f "$REPORT_DIR/docker_log_${CNAME}_$(printf "%02d" $i).txt" ]; do i=$((i+1)); done
-        $DOCKER_CMD logs "$CNAME" > "$REPORT_DIR/docker_log_${CNAME}_$(printf "%02d" $i).txt" 2>&1
         $DOCKER_CMD rm "$CNAME" > /dev/null 2>&1
-        echo -e "${GREEN}[INFO]${NC} Контейнер $CNAME удален."
+        bash_log "${GREEN}" "Контейнер $CNAME удален."
         $DOCKER_CMD image prune -f > /dev/null 2>&1
     fi
 }
@@ -381,6 +391,7 @@ run_download() {
     if [ "$AUTO_MODE" == "1" ]; then
         if [ "$BATCH_AUTO" == "1" ]; then
             local elapsed=0
+            # Ждем завершения контейнера
             while $DOCKER_CMD inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null | grep -qw "true"; do
                 sleep 10
                 elapsed=$((elapsed + 10))
@@ -390,6 +401,8 @@ run_download() {
                     break
                 fi
             done
+            # Контейнер остановлен. Выгружаем весь лог разом в BATCH_LOG
+            $DOCKER_CMD logs "$CONTAINER_NAME"
         else
             $DOCKER_CMD logs -f "$CONTAINER_NAME"
         fi
@@ -470,6 +483,17 @@ if [ "$1" == "--batch" ] || [ "$1" == "--batch-auto" ] || [ "$1" == "--auto" ]; 
     AUTO_MODE="1"
     [ "$1" == "--batch-auto" ] && BATCH_AUTO="1"
 
+    # Парсим дополнительные флаги (например, --notify-tg), чтобы применить их ко всему пакету
+    shift
+    if [ "$#" -gt 0 ]; then
+        parse_args "$@"
+    fi
+    GLOBAL_BATCH_OPTS=""
+    [ "$VERBOSE_FLAG" == "1" ] && GLOBAL_BATCH_OPTS+=" -v"
+    [ "$NOTIFY_TG" == "1" ] && GLOBAL_BATCH_OPTS+=" --notify-tg"
+    [ "$TRACE_STATUS" == "1" ] && GLOBAL_BATCH_OPTS+=" --trace-status"
+    [ "$TRACE_MEM" == "1" ] && GLOBAL_BATCH_OPTS+=" --trace-mem"
+
     if [ ! -f "$SOURCES_TXT" ] || ! head -n 1 "$SOURCES_TXT" | grep -q "^# Имя"; then
         echo "# Имя | Ссылка | Папка | Файлов | Опции" > "$SOURCES_TXT"
     fi
@@ -491,7 +515,9 @@ if [ "$1" == "--batch" ] || [ "$1" == "--batch-auto" ] || [ "$1" == "--auto" ]; 
     # Очистка старого состояния пакетной обработки
     rm -f "$LOCK_FILE"
     
-    BATCH_LOG="$REPORT_DIR/batch_log_$(date +%Y%m%d_%H%M%S).txt"
+    # Получаем время для имени файла из Docker-образа (для корректного TZ)
+    batch_ts=$($DOCKER_CMD run --rm -e TZ="$TZ" "$DOCKER_IMG" python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y%m%d_%H%M%S'))" 2>/dev/null || date +%Y%m%d_%H%M%S)
+    BATCH_LOG="$REPORT_DIR/batch_${batch_ts}.txt"
 
     run_batch() {
         for i in "${!BATCH_ARRAY[@]}"; do
@@ -509,9 +535,11 @@ if [ "$1" == "--batch" ] || [ "$1" == "--batch-auto" ] || [ "$1" == "--auto" ]; 
             REFRESH_CACHE="0"; BUILD_QUEUE="0"; AUTH_MODE="0"; AUTH_DISABLE="0"
             USE_VPN="0"; HOMEOSTASIS_OFF="0"; SIMULATE_BAN="0"; SSL_OFF="0"
             NUM_THREADS=1; Q_FILES=1; MD5_TARGET=""; MOVE_EXTRA=""; VERBOSE_FLAG="0"
+            NOTIFY_TG="0"; TRACE_MEM="0"; TRACE_STATUS="0"
             
-            if [ -n "$opts" ]; then 
-                eval "set -- $opts"
+            # Применяем флаги из source_links.txt И глобальные флаги --batch-auto
+            if [ -n "$opts" ] || [ -n "$GLOBAL_BATCH_OPTS" ]; then 
+                eval "set -- $opts $GLOBAL_BATCH_OPTS"
                 parse_args "$@"
             fi
             
@@ -520,12 +548,14 @@ if [ "$1" == "--batch" ] || [ "$1" == "--batch-auto" ] || [ "$1" == "--auto" ]; 
         done
         > "$SOURCES_TXT"
         for l in "${BATCH_ARRAY[@]}"; do echo "$l" >> "$SOURCES_TXT"; done
-        echo -e "${GREEN}[INFO]${NC} Пакетная выгрузка завершена."
+        bash_log "${GREEN}" "Пакетная выгрузка завершена."
     }
 
     if [ "$BATCH_AUTO" == "1" ]; then
-        echo -e "${GREEN}[INFO]${NC} Запуск в фоновом режиме (cron)..."
-        run_batch > "$BATCH_LOG" 2>&1 &
+        bash_log "${GREEN}" "Запуск в фоновом режиме (cron)..."
+        # Очищаем файл перед стартом, а затем дописываем (>>) на каждой итерации
+        > "$BATCH_LOG"
+        run_batch >> "$BATCH_LOG" 2>&1 &
         echo "PID: $! | Лог: $BATCH_LOG"
         exit 0
     else

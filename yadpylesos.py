@@ -1,7 +1,7 @@
 # ==========================================
 # Проект: Я.Д-Пылесос / YA.D-Pylesos
 # Скрипт: yadpylesos.py
-# Версия: 13.0 (Refactored)
+# Версия: 13.1
 # ==========================================
 
 import argparse
@@ -1282,6 +1282,8 @@ class YadpylesosMain:
         parser.add_argument('--db-check', action='store_true', help="Проверить целостность БД и выйти")
         parser.add_argument('--vacuum', action='store_true', help="Сжать и оптимизировать все базы данных (VACUUM)")
         parser.add_argument('--auth-status', action='store_true', help="Проверить статус авторизации (токен, куки) и выйти")
+        parser.add_argument('--auth-enable', action='store_true', help="Включить глобальную авторизацию (OAuth 2.0)")
+        parser.add_argument('--auth-disable', action='store_true', help="Отключить глобальную авторизацию")
         parser.add_argument('--unattended', action='store_true', help="Тихий режим для cron")
         parser.add_argument('--simulate-ban', action='store_true', help="Симулировать бан API для теста VPN")
         parser.add_argument('--refresh-cache', action='store_true', help="Принудительно обновить кэш дерева")
@@ -1368,7 +1370,7 @@ class YadpylesosMain:
         self.stats_lock = threading.Lock()
         self.stop_event = threading.Event()
 
-        self.LOG_FILE = os.path.join(REPORT_DIR, f"docker_log_{self.container_name}_verbose_{datetime.now().astimezone().strftime('%Y%m%d_%H%M%S')}.txt")
+        self.LOG_FILE = os.path.join(REPORT_DIR, f"{self.container_name}_{datetime.now().astimezone().strftime('%Y%m%d_%H%M%S')}.txt")
         
         logger.setLevel(logging.DEBUG)
         ch = logging.StreamHandler()
@@ -1376,11 +1378,14 @@ class YadpylesosMain:
         ch.setFormatter(ColorFormatter('[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
         ch.addFilter(SecretFilter())
         logger.addHandler(ch)
-        fh = RotatingFileHandler(self.LOG_FILE, maxBytes=CONFIG["MAX_LOG_SIZE"], backupCount=CONFIG["MAX_LOG_FILES"], encoding='utf-8')
-        fh.setLevel(logging.DEBUG)
-        fh.setFormatter(logging.Formatter('[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
-        fh.addFilter(SecretFilter())
-        logger.addHandler(fh)
+        
+        # Файл лога создается только при реальном скачивании (не служебные команды)
+        if not self._is_service_mode():
+            fh = RotatingFileHandler(self.LOG_FILE, maxBytes=CONFIG["MAX_LOG_SIZE"], backupCount=CONFIG["MAX_LOG_FILES"], encoding='utf-8')
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(logging.Formatter('[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+            fh.addFilter(SecretFilter())
+            logger.addHandler(fh)
 
         # Инициализация компонентов
         self.db = DatabaseManager(self.db_file)
@@ -1400,7 +1405,8 @@ class YadpylesosMain:
         self.tg = TelegramService(self)
 
     def _is_service_mode(self):
-        return any([self.args.db_stats, self.args.db_check, self.args.vacuum, self.args.auth_status, self.args.manage])
+        return any([self.args.db_stats, self.args.db_check, self.args.vacuum, self.args.auth_status, self.args.manage, self.args.auth_enable, self.args.auth_disable])
+        
     def chown_file(self, filepath):
         try:
             if os.path.isdir(filepath): os.chmod(filepath, 0o755)
@@ -1575,14 +1581,20 @@ class YadpylesosMain:
                 sys.exit(1)
 
     def _cleanup_old_logs(self):
-        try:
-            now = time.time()
-            for f in os.listdir("/report"):
-                fp = os.path.join("/report", f)
-                if os.path.isfile(fp) and now - os.path.getmtime(fp) > 7 * 86400:
-                    os.remove(fp)
-        except OSError: pass
-
+        import glob
+        days = int(os.environ.get('LOG_RETENTION_DAYS', '14'))
+        now = time.time()
+        # Маски: batch_*.txt (сессии), failed_* (ошибки), *_*.txt (детальные логи контейнеров), *_*.txt.* (ротация логов)
+        log_patterns = ["batch_*.txt", "failed_*", "*_*.txt", "*_*.txt.*"]
+        for pattern in log_patterns:
+            for filepath in glob.glob(os.path.join(REPORT_DIR, pattern)):
+                # Строгая защита журнала VPN и БД телеметрии от случайного удаления
+                if "vpn_audit.log" in filepath or "telemetry" in filepath: continue
+                try:
+                    if now - os.path.getmtime(filepath) > days * 86400:
+                        os.remove(filepath)
+                except OSError: pass
+                
     def preflight_check(self):
         self._check_required_dirs()
         try: os.chmod("/db", 0o700)
@@ -2046,6 +2058,7 @@ class YadpylesosMain:
             print(f"БД: {os.path.basename(db_path)} - занята другим процессом")
 
     def process_all(self, public_key, dest="/download"):
+        self._cleanup_old_logs()
         if self.args.manage:
             self.manage_sources_cli()
             return True
