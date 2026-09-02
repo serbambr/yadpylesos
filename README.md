@@ -1,4 +1,4 @@
-cat > README.md << 'RM_EOF'
+
 # Я.Д-Пылесос / YA.D-Pylesos
 
 Я.Д-Пылесос — утилита для скачивания с Яндекс.Диска, YouTube и Boosty на Linux ARM64 (QNAP NAS) и AMD64 (Fedora WS).
