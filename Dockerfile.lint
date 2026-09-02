@@ -1,0 +1,9 @@
+FROM python:3.12-slim
+# shellcheck ставим из Debian (arm64 wheel shellcheck-py качает бинарник с GitHub,
+# недоступного из сети NAS); ruff/vulture/radon — с pypi.
+# Зеркало Яндекса: deb.debian.org (Fastly) недоступен из сети NAS
+RUN sed -i 's|deb.debian.org|mirror.yandex.ru|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends shellcheck \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir radon ruff vulture

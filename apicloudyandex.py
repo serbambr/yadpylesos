@@ -63,7 +63,7 @@ class YandexAPIService(BaseCloudProvider):
         methods = []
         if token_ok: methods.append("OAuth Токен")
         if cookies_ok: methods.append("Cookies")
-        
+
         if methods:
             methods_str = " + ".join(methods)
             app.auth_details_msg = f"Доступ к API разрешен (200 OK). В сессию загружены: {methods_str}."
@@ -82,7 +82,7 @@ class YandexAPIService(BaseCloudProvider):
             else:
                 sess.cookies = http.cookiejar.MozillaCookieJar(credential)
                 sess.cookies.load(ignore_discard=True)
-            
+
             resp = sess.get('https://cloud-api.yandex.net/v1/disk/', timeout=10)
             return resp.status_code == 200
         except (requests.exceptions.RequestException, http.cookiejar.LoadError, OSError):
@@ -113,7 +113,7 @@ class YandexAPIService(BaseCloudProvider):
 
     def _handle_vpn_failover(self):
         if not (self.app.vpn_manager.available and not self.session_api.proxies):
-            return False 
+            return False
         self.app.log("[INFO] Проверка доступности интернета напрямую...")
         try:
             test_resp = self.session_cdn.get('http://www.gstatic.com/generate_204', timeout=10)
@@ -125,9 +125,10 @@ class YandexAPIService(BaseCloudProvider):
         self.app.log("[КРИТИЧНО] Интернет работает. Вероятно, Яндекс заблокировал IP. Запуск VPN...")
         if self.app.vpn_manager.start():
             if self.app.vpn_manager.test_tunnel():
-                self.app.vpn_manager.proxies = {'http': 'http://127.0.0.1:7890', 'https': 'http://127.0.0.1:7890'}
+                self.app.vpn_manager.proxies = {'http': self.app.vpn_manager.http_proxy_url, 'https': self.app.vpn_manager.http_proxy_url}
                 self.session_api.proxies = self.app.vpn_manager.proxies
-                self.app.log("[УСПЕХ] VPN-туннель активирован и протестирован. Трафик API переключен.")
+                self.session_cdn.proxies = self.app.vpn_manager.proxies
+                self.app.log("[УСПЕХ] VPN-туннель активирован и протестирован. Трафик API и CDN переключен.")
                 self.app.vpn_manager.start_watchdog()
                 return True
             else:
@@ -146,21 +147,28 @@ class YandexAPIService(BaseCloudProvider):
         wait_time = int(retry_after) + 10 if retry_after and retry_after.isdigit() else self.ban_wait_time
         self.ban_wait_time = min(self.ban_wait_time * 2, CONFIG["MAX_BAN_WAIT"])
         self.consecutive_errors += 1
-        
+
         if self.consecutive_errors >= CONFIG["MAX_RETRIES"]:
             self.app.log("[КРИТИЧНО] Пауза. Сеть или API недоступны.")
-            if self._handle_vpn_failover():
-                self.consecutive_errors = 0
-                self.ban_wait_time = CONFIG["INITIAL_BAN_WAIT"]
-                self.current_api_pause = self.MIN_API_PAUSE
-                return self.fetch_yandex_api(url, params)
-            self.app.db.save_cache(self.app)
-            self.app.db.save_global_state(self.app)
-            raise SystemExit("vpn tunnel test failed")
-            
+            return self._recover_after_bans()
+
         self.app.set_status(f"[БАН 429] Ожидание {wait_time} сек")
         self.app.stop_event.wait(timeout=wait_time)
         return 'continue'
+
+    def _recover_after_bans(self):
+        if self.session_api.proxies:
+            rotated = self.app.vpn_manager.switch_to_next_server()
+        else:
+            rotated = self._handle_vpn_failover()
+        if rotated:
+            self.consecutive_errors = 0
+            self.ban_wait_time = CONFIG["INITIAL_BAN_WAIT"]
+            self.current_api_pause = self.MIN_API_PAUSE
+            return 'reset'
+        self.app.db.save_cache(self.app)
+        self.app.db.save_global_state(self.app)
+        raise SystemExit("vpn tunnel test failed")
 
     def _handle_api_http_errors(self, resp):
         if resp.status_code in (401, 403):
@@ -190,18 +198,19 @@ class YandexAPIService(BaseCloudProvider):
         http_err = self._handle_api_http_errors(resp)
         if http_err == 'fail': return None
         if http_err == 'continue': return 'retry'
-        
+
         if resp.status_code == 429:
-            if self._handle_api_429(resp, url, params) == 'continue': return 'retry'
-            return None
-            
+            verdict = self._handle_api_429(resp, url, params)
+            if verdict == 'continue': return 'retry'
+            return verdict
+
         if self._is_silent_ban(resp):
             with self.app.stats_lock: self.app.stats['retries'] += 1
             logger.warning("[ВНИМАНИЕ] API вернуло HTML вместо JSON. Возможен тихий бан.")
             self.app.stop_event.wait(timeout=self.ban_wait_time)
             self.ban_wait_time = min(self.ban_wait_time * 2, CONFIG["MAX_BAN_WAIT"])
             return 'retry'
-            
+
         resp_json = resp.json()
         if 'error' in resp_json:
             with self.app.stats_lock: self.app.stats['retries'] += 1
@@ -213,24 +222,36 @@ class YandexAPIService(BaseCloudProvider):
         return resp_json
 
     def fetch_yandex_api(self, url, params):
-        for attempt in range(CONFIG["MAX_RETRIES"]):
+        attempt = 0
+        failover_rounds = 0
+        while attempt < CONFIG["MAX_RETRIES"]:
             try:
                 t = time.time()
                 if self.app.simulate_ban:
                     resp = self._simulate_network_issues()
-                    with self.app.stats_lock: 
+                    with self.app.stats_lock:
                         self.app.stats['api_time'] += time.time() - t
                         self.app.stats['api_req_count'] += 1
                 else:
                     resp = self.session_api.get(url, params=params, timeout=CONFIG["API_TIMEOUT"])
-                    with self.app.stats_lock: 
+                    with self.app.stats_lock:
                         self.app.stats['api_time'] += time.time() - t
                         self.app.stats['api_req_count'] += 1
-                    
+
                 result = self._get_valid_api_response(resp, url, params)
-                if result == 'retry': continue
+                if result == 'retry':
+                    attempt += 1
+                    continue
+                if result == 'reset':
+                    failover_rounds += 1
+                    if failover_rounds > 3:
+                        self.app.db.save_cache(self.app)
+                        self.app.db.save_global_state(self.app)
+                        raise SystemExit("vpn tunnel test failed")
+                    attempt = 0
+                    continue
                 if result is None: return None
-                    
+
                 self.ban_wait_time = CONFIG["INITIAL_BAN_WAIT"]
                 self.current_api_pause = max(self.MIN_API_PAUSE, self.current_api_pause - 0.1)
                 self.consecutive_errors = 0
@@ -238,6 +259,7 @@ class YandexAPIService(BaseCloudProvider):
             except Exception as e:
                 if not self._handle_api_exceptions(e, url, params):
                     raise
+            attempt += 1
         return None
 
     def fetch_api_items(self, public_key, current_path, api_url):
@@ -272,7 +294,7 @@ class YandexAPIService(BaseCloudProvider):
                     self.app.auth_status_msg = "Только Cookies"
                 else:
                     self.app.log("[ВНИМАНИЕ] Переход в анонимный режим через 15 сек...")
-                    time.sleep(15)
+                    self.app.stop_event.wait(timeout=15)
                     self.app.auth_status_msg = "Анонимный"
             elif resp.status_code == 200:
                 self.app.log("[INFO] Проверка API: Токен валиден (200 OK).")

@@ -30,7 +30,7 @@ echo -e "${GREEN}Docker найден и доступен.${NC}"
 
 # 2. Создание структуры папок
 echo -e "${YELLOW}[2/7]${NC} Создание структуры папок..."
-mkdir -p "$BASE_DIR/auth" "$BASE_DIR/backups" "$BASE_DIR/db" "$BASE_DIR/report" "$BASE_DIR/test" "$BASE_DIR/vpn"
+mkdir -p "$BASE_DIR/auth" "$BASE_DIR/db" "$BASE_DIR/report" "$BASE_DIR/vpn" "$BASE_DIR/config" "$BASE_DIR/history" "$BASE_DIR/backup"
 chmod 700 "$BASE_DIR/auth"
 echo -e "${GREEN}Папки (auth, backups, db, report, test, vpn) созданы.${NC}"
 
@@ -81,8 +81,7 @@ fi
 # 6. Сборка Docker-образа
 echo -e "${YELLOW}[6/7]${NC} Сборка Docker-образа yadpylesos-slim..."
 if [ -f "$BASE_DIR/Dockerfile.yadpylesos-slim" ]; then
-    $DOCKER_CMD build -t yadpylesos-slim -f "$BASE_DIR/Dockerfile.yadpylesos-slim" "$BASE_DIR"
-    if [ $? -ne 0 ]; then
+    if ! $DOCKER_CMD build -t yadpylesos-slim -f "$BASE_DIR/Dockerfile.yadpylesos-slim" "$BASE_DIR"; then
         echo -e "${RED}[ОШИБКА]${NC} Не удалось собрать Docker-образ."
         exit 1
     fi

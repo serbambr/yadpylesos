@@ -3,5 +3,13 @@ _.verify
 _.session_api.verify
 _.session_cdn.verify
 
-# Заглушки для будущих провайдеров
+# Контракт ядра: провайдеры реализуют единый интерфейс, диспетчеризация динамическая
+# (вызовы self.app.api.* резолвятся в рантайме по типу провайдера)
+VideoAPIService.fetch_yandex_api
+VideoAPIService.fetch_api_items
+VideoAPIService.map_yandex_item
 MailAPIService
+
+# Контрактный атрибут: читается ядром при финализации любого провайдера
+# (save_global_state; восстановлен Правкой 15 Спринта 2)
+VideoAPIService.current_api_pause

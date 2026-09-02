@@ -1,26 +1,30 @@
 # Секреты и авторизация
 auth/
-.env
 
 # Базы данных и кэши
 db/
 cache/
 .ruff_cache/
+build_assets/
 
 # Логи и отчеты
 report/
 .lock
 .pid
 yadpylesos.lock
+history
 
 # Бекапы и тесты
 *.bak
+*.old.*
 *.part
 *.corrupt
 *.tmp
 __pycache__/
 backup/
 testing/
+build_assets/
+cache/
 
 # Источник ссылок
 source_links.txt
@@ -33,8 +37,6 @@ vpn/
 !vpn/link1.txt.example
 
 # Инструменты
-ADR/
+documentation/commands.md
 documention/TECHNIQUES.md
-documention/commands.md
-documention/PROJECT_PRINCIPLES.md
 

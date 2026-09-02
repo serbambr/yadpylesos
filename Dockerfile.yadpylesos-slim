@@ -14,12 +14,11 @@ ENV PYTHONUNBUFFERED=1
 # Задаем рабочую директорию внутри контейнера
 WORKDIR /app
 
-# BL-Infra: Использование ARG для версий (DRY)
-ARG MIHOMO_VERSION=v1.18.5
-
 # Устанавливаем системные утилиты: tzdata (часовые пояса) и ca-certificates (SSL)
-# Также добавляем wget и gzip для скачивания mihomo
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Также добаваем wget и gzip для скачивания mihomo
+# Зеркало Яндекса: deb.debian.org (Fastly) недоступен из сети NAS
+RUN sed -i 's|deb.debian.org|mirror.yandex.ru|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
     tzdata \
     ca-certificates \
     curl \
@@ -28,7 +27,47 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     locales \
     wget \
     gzip \
+    unzip \
+    ffmpeg \
+    gnupg \
     && rm -rf /var/lib/apt/lists/*
+
+# Node.js 24 LTS (NodeSource): node 20 из репозитория Debian не поддерживается EJS в yt-dlp
+RUN mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_24.x nodistro main" > /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Установка Xray-core для модуля VPN (Нативная поддержка Reality и XHTTP)
+#ARG XRAY_VERSION="v26.7.28"
+#RUN dpkg_arch=$(dpkg --print-architecture) && \
+#    if [ "$dpkg_arch" = "amd64" ]; then xray_arch="64"; \
+#    elif [ "$dpkg_arch" = "arm64" ]; then xray_arch="arm64-v8a"; \
+#    else xray_arch="$dpkg_arch"; fi && \
+#    wget -qO /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-${xray_arch}.zip" && \
+#    unzip /tmp/xray.zip -d /tmp/xray && \
+#    mv /tmp/xray/xray /usr/local/bin/xray && \
+#    chmod +x /usr/local/bin/xray && \
+#    mkdir -p /etc/xray && \
+#    mv /tmp/xray/geoip.dat /etc/xray/ && \
+#    mv /tmp/xray/geosite.dat /etc/xray/ && \
+#    rm -rf /tmp/xray*
+# Xray-core поставляется в build_assets/ (скачивается вне сборки:
+# Fastly-CDN GitHub недоступен из сети NAS). Текущий бинарник: v26.7.28, arm64-v8a
+
+#скачать пакет, положить в build_assets/
+#wget https://github.com/XTLS/Xray-core/releases/download/v26.7.28/Xray-linux-arm64-v8a.zip
+COPY build_assets/Xray-linux-arm64-v8a.zip /tmp/xray.zip
+# bgutil PO-провайдер: исходники + скомпилированный build/ + node_modules (собрано на D4 через npmmirror)
+COPY build_assets/bgutil-server/server /opt/bgutil
+RUN unzip -o /tmp/xray.zip -d /tmp/xray && \
+    mv /tmp/xray/xray /usr/local/bin/xray && \
+    chmod +x /usr/local/bin/xray && \
+    mkdir -p /etc/xray && \
+    mv /tmp/xray/geoip.dat /etc/xray/ && \
+    mv /tmp/xray/geosite.dat /etc/xray/ && \
+    rm -rf /tmp/xray*
 
 # Генерируем русскую локаль для безупречной работы с кириллицей в путях и логах
 RUN sed -i '/ru_RU.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
@@ -45,20 +84,6 @@ RUN groupadd -r appgroup && useradd -r -g appgroup appuser
 # BL-Infra: Использование requirements.txt (Pin versions)
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
-
-# Установка mihomo (Clash.Meta) для модуля VPN
-# Скачиваем бинарник
-RUN ARCH=$(dpkg --print-architecture) && \
-    wget -qO /tmp/mihomo.gz "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-${ARCH}-${MIHOMO_VERSION}.gz" && \
-    gunzip /tmp/mihomo.gz && \
-    mv /tmp/mihomo /usr/local/bin/mihomo && \
-    chmod +x /usr/local/bin/mihomo
-
-# BL-Fix: Скачиваем базы GeoIP/GeoSite в системную папку
-RUN mkdir -p /etc/mihomo && \
-    wget -qO /etc/mihomo/geoip.metadb "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb" && \
-    wget -qO /etc/mihomo/geosite.dat "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat" && \
-    wget -qO /etc/mihomo/geoip.dat "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat"
 
 # Базовая команда
 CMD ["sleep", "infinity"]

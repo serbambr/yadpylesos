@@ -1,8 +1,9 @@
 #!/bin/bash
+# shellcheck disable=SC2001,SC2015,SC2004  # осознанные идиомы: sed читабельнее ${//}; A&&B||C на guard-ветках безопасен (присваивание не падает); $ в арифметике стилистика
 # ==========================================
 # Проект: Я.Д-Пылесос / YA.D-Pylesos
 # Скрипт: yadpylesos.sh
-# Версия: 13.1
+# Версия: 14.0
 # ==========================================
 
 set -euo pipefail
@@ -36,6 +37,10 @@ else
     exit 1
 fi
 
+# Дефолты критичных переменных (F-85): отсутствие их в .env не должно убивать скрипт по set -u
+DOCKER_IMG="${DOCKER_IMG:-yadpylesos-slim}"
+MAX_RUNTIME="${MAX_RUNTIME:-21600}"
+
 # Раскручиваем симлинк, чтобы найти реальный путь скрипта
 SCRIPT_RESOLVED="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 BASE_DIR="$(cd "$(dirname "$SCRIPT_RESOLVED")" && pwd)"
@@ -46,13 +51,14 @@ LOCK_FILE="$BASE_DIR/.lock"
 REPORT_DIR="$BASE_DIR/report"
 DB_DIR="$BASE_DIR/db"
 AUTH_DIR="$BASE_DIR/auth"
-SOURCES_TXT="$BASE_DIR/source_links.txt"
+SOURCES_TXT="$BASE_DIR/config/source_links.txt"
 # BL-Env: Поддержка файла .env
 ENV_FILE="$BASE_DIR/.env"
 ENV_ARGS=()
 if [ -f "$ENV_FILE" ]; then
     # Читаем .env локально для bash (для LOG_OPTS и MAX_RUNTIME)
     set -a
+    # shellcheck disable=SC1090  # динамический source пользовательского .env — замысел
     . "$ENV_FILE"
     set +a
     # Явно экспортируем часовой пояс для команды date в Bash
@@ -68,13 +74,13 @@ LOG_OPTS="--log-opt max-size=${LOG_MAX_SIZE} --log-opt max-file=${LOG_MAX_FILES}
 
 show_help() {
     echo -e "${CYAN}=============================================${NC}"
-    echo -e " Я.Д-Пылесос ${GREEN}v13.1${NC}"
-    echo -e " Использование: ./yadpylesos '<Имя_контейнера>' '<Ссылка_Яндекс>' '<Папка_назначения>' [Опции]"
+    echo -e " Я.Д-Пылесос ${GREEN}v14.0${NC}"
+    echo -e " Использование: ./yadpylesos '<Имя_контейнера>' '<Ссылка_на_источник>' '<Папка_назначения>' [Опции]"
     echo -e " Или для пакетного режима: ./yadpylesos --batch"
     echo -e "${CYAN}=============================================${NC}"
     echo " АРГУМЕНТЫ:"
     echo "  <Имя_контейнера>      Уникальное имя для процесса."
-    echo "  <Ссылка_Яндекс>       Ссылка на Яндекс.Диск."
+    echo "  <Ссылка_на_источник>  Ссылка на источник (Яндекс.Диск / YouTube)."
     echo "  <Папка_назначения>    Локальный путь для сохранения файлов (напр. /path/to/download)."
     echo "  [Кол-во_файлов]       Ожидаемое количество файлов (для прогресс-бара)."
     echo -e "${CYAN}=============================================${NC}"
@@ -86,9 +92,11 @@ show_help() {
     echo "  --threads=N           Потоки для одного файла (1-8)."
     echo "  --quantity-files=N    Параллельное скачивание файлов (1-8)."
     echo "  --move-extra='/путь/' Перенос осиротевших файлов в карантин."
+    echo "  --force               Принудительное скачивание (игнорировать архив)."
     echo "  --md5='имя_файла'     Проверить MD5 конкретного файла."
     echo -e "${CYAN}=============================================${NC}"
     echo "  --vpn                 Принудительно запускать VPN при старте."
+    echo "  --vpn-test            Проверить работоспособность VPN (поднять туннель и узнать IP)."
     echo "  --auth-enable         Включить глобальную авторизацию (OAuth 2.0)."
     echo "  --auth-disable        Отключить глобальную авторизацию."
     echo "  --auth-status         Проверить статус авторизации (токен, куки)."
@@ -112,7 +120,7 @@ ask_yes_no() {
     local prompt="$1"
     local response
     while true; do
-        read -p "$prompt (yes/no): " response
+        read -r -p "$prompt (yes/no): " response
         response=$(echo "$response" | tr '[:upper:]' '[:lower:]')
         case "$response" in
             y|yes|д|да) return 0 ;;
@@ -125,7 +133,8 @@ ask_yes_no() {
 validate_folder() {
     local folder="$1"
     if [ -d "$folder" ]; then return 0; fi
-    local parent_dir=$(dirname "$folder")
+    local parent_dir
+    parent_dir=$(dirname "$folder")
     if [ -d "$parent_dir" ]; then
         echo -e "${YELLOW}[ВНИМАНИЕ]${NC} Папка '$folder' не существует."
         if ask_yes_no "Создать её?"; then
@@ -139,16 +148,20 @@ validate_folder() {
 upsert_source() {
     [ ! -f "$SOURCES_TXT" ] && echo "# Имя | Ссылка | Папка | Файлов | Опции" > "$SOURCES_TXT"
     local u_cname="$1" u_link="$2" u_dest="$3" u_total="$4" u_opts="${5:-}"
-    local tmp_file=$(mktemp)
+    local tmp_file
+    tmp_file=$(mktemp)
     local found=0
     
     while IFS= read -r line || [ -n "$line" ]; do
-        local clean_line=$(echo "$line" | sed 's/^#//')
-        local line_cname=$(echo "$clean_line" | cut -d'|' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        local clean_line
+        clean_line=$(echo "$line" | sed 's/^#//')
+        local line_cname
+        line_cname=$(echo "$clean_line" | cut -d'|' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         
         if [ "$line_cname" == "$u_cname" ]; then
             # Строка существует. Берем флаги СТРОГО из старой записи, игнорируя переданные.
-            local old_opts=$(echo "$clean_line" | cut -d'|' -f5 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            local old_opts
+            old_opts=$(echo "$clean_line" | cut -d'|' -f5 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             local new_line="# $u_cname | $u_link | $u_dest | $u_total | $old_opts"
             echo "$new_line" >> "$tmp_file"
             found=1
@@ -172,12 +185,13 @@ parse_args() {
             --refresh-cache) REFRESH_CACHE="1" ;;
             --build-queue) BUILD_QUEUE="1" ;;
             --vpn) USE_VPN="1" ;;
-            --auth-enable) AUTH_MODE="1" ;;
-            --auth-disable) AUTH_DISABLE="1" ;;
+            --auth-enable) ;;
+            --auth-disable) ;;
             --homeostasis-off) HOMEOSTASIS_OFF="1" ;;
             --simulate-ban) SIMULATE_BAN="1" ;;
             --ssl-off) SSL_OFF="1" ;;
             --notify-tg) NOTIFY_TG="1" ;;
+            --force) FORCE_FLAG="1" ;;
             --trace-mem) TRACE_MEM="1" ;;
             --trace-status) TRACE_STATUS="1" ;;
             --threads=*)
@@ -204,7 +218,14 @@ cleanup() {
     if $DOCKER_CMD inspect -f '{{.State.Status}}' "$CNAME" 2>/dev/null | grep -qw "exited"; then
         $DOCKER_CMD rm "$CNAME" > /dev/null 2>&1
         bash_log "${GREEN}" "Контейнер $CNAME удален."
-        $DOCKER_CMD image prune -f > /dev/null 2>&1
+    fi
+    if [ -z "${DOCKER_IMG:-}" ]; then return; fi
+    local stale_ids
+    stale_ids=$($DOCKER_CMD ps -aq --filter "ancestor=$DOCKER_IMG" --filter "status=exited" 2>/dev/null || true)
+    if [ -n "$stale_ids" ]; then
+        # shellcheck disable=SC2086  # умышленный word-splitting: stale_ids содержит список ID через пробел
+        $DOCKER_CMD rm $stale_ids > /dev/null 2>&1 || true
+        bash_log "${GREEN}" "Очистка: удалены остановленные контейнеры Пылесоса."
     fi
 }
 
@@ -259,7 +280,7 @@ run_download() {
             echo -e "${GREEN}[INFO]${NC} Старый контейнер остановлен и удален."
             break
         else
-            read -p "Введите новое имя (или Enter для отмены): " NEW_NAME
+            read -r -p "Введите новое имя (или Enter для отмены): " NEW_NAME
             if [ -z "$NEW_NAME" ]; then echo -e "${RED}[ОТМЕНА]${NC} Скрипт остановлен."; exit 1; fi
             CONTAINER_NAME="$NEW_NAME"
             trap 'cleanup "$CONTAINER_NAME"' EXIT
@@ -275,6 +296,10 @@ run_download() {
     
     # Формируем массив DNS
     local DNS_ARGS=()
+    if [ -z "${DNS_SERVERS:-}" ]; then
+        echo -e "${RED}[КРИТИЧНО]${NC} DNS_SERVERS не задан в .env (пример: DNS_SERVERS=\"8.8.8.8 1.1.1.1\"). Запуск невозможен." >&2
+        exit 1
+    fi
     for ip in $DNS_SERVERS; do
         DNS_ARGS+=("--dns" "$ip")
     done
@@ -295,7 +320,11 @@ run_download() {
         str_sim_ban=$([ "$SIMULATE_BAN" == "1" ] && echo -e "${RED}Вкл${NC}" || echo "Выкл")
         str_move=$([ -n "$MOVE_EXTRA" ] && echo "$MOVE_EXTRA" || echo "Нет")
         str_md5=$([ -n "$MD5_TARGET" ] && echo "$MD5_TARGET" || echo "Нет")
-        str_files=$([ "$T_FILES" -gt 0 ] 2>/dev/null && echo "$T_FILES" || echo "Авто")
+        if [ "$T_FILES" -gt 0 ] 2>/dev/null; then
+            str_files="$T_FILES файлов"
+        else
+            str_files="Авто"
+        fi
 
         echo -e "${CYAN}============================================="
         echo -e " ${GREEN}🚀 Я.Д-Пылесос | Подготовка к запуску${NC}"
@@ -303,7 +332,7 @@ run_download() {
         echo -e " 📦 Контейнер:   ${YELLOW}$CONTAINER_NAME${NC}"
         echo -e " 🔗 Ссылка:      $DL_LINK"
         echo -e " 📁 Папка:       $DEST"
-        echo -e " 📄 Ожидается:   $str_files файлов"
+        echo -e " 📄 Ожидается:   $str_files"
         echo -e "${CYAN}---------------------------------------------${NC}"
         echo -e " ⚙️  Параметры скачивания:"
         echo -e "   • Потоки (на файл):    $NUM_THREADS"
@@ -341,6 +370,7 @@ run_download() {
     [ "$SIMULATE_BAN" == "1" ] && PY_ARGS+=("--simulate-ban")
     [ "$SSL_OFF" == "1" ] && PY_ARGS+=("--ssl-off")
     [ "$NOTIFY_TG" == "1" ] && PY_ARGS+=("--notify-tg")
+    [ "$FORCE_FLAG" == "1" ] && PY_ARGS+=("--force")
     [ "$TRACE_MEM" == "1" ] && PY_ARGS+=("--trace-mem")
     [ "$TRACE_STATUS" == "1" ] && PY_ARGS+=("--trace-status")
     [ -n "$NUM_THREADS" ] && PY_ARGS+=("--num-threads=$NUM_THREADS")
@@ -352,12 +382,13 @@ run_download() {
     local LOG_OPTS="--log-opt max-size=$LOG_MAX_SIZE --log-opt max-file=$LOG_MAX_FILES"
 
     if [ -n "$MD5_TARGET" ]; then
+        # shellcheck disable=SC2086,SC2046  # LOG_OPTS разворачивается в флаги; id возвращает число
         $DOCKER_CMD run --rm -it --name "$CONTAINER_NAME" "${ENV_ARGS[@]}" $LOG_OPTS \
           --user $(id -u):$(id -g) \
           "${DNS_ARGS[@]}" \
-          -v "$SCRIPT_PATH":/app/yadpylesos.py -v "$BASE_DIR/apiyandex.py":/app/apiyandex.py -v "$BASE_DIR/vpn_manager.py":/app/vpn_manager.py \
-          -v "$BASE_DIR/config.yaml":/app/config.yaml:ro \
-          -v "$AUTH_DIR":/auth:ro -v "$BASE_DIR/vpn":/vpn -v "$REPORT_DIR":/report \
+          -v "$SCRIPT_PATH":/app/yadpylesos.py -v "$BASE_DIR/apicloudyandex.py":/app/apicloudyandex.py -v "$BASE_DIR/vpnmanager.py":/app/vpnmanager.py -v "$BASE_DIR/apivideo.py":/app/apivideo.py \
+          -v "$BASE_DIR/config":/config:ro -v "$BASE_DIR/cache/yt-dlp":/cache-yt \
+          -v "$AUTH_DIR":/auth -v "$BASE_DIR/vpn":/vpn -v "$REPORT_DIR":/report \
           -v "$DB_DIR":/db -v "$DEST":/download \
           -v "$THERMAL_CPU_PATH":/sys_thermal_cpu:ro \
           "$DOCKER_IMG" python3 -u /app/yadpylesos.py "${PY_ARGS[@]}"
@@ -365,13 +396,15 @@ run_download() {
         return
     fi
 
+    # shellcheck disable=SC2086,SC2046  # LOG_OPTS разворачивается в флаги; id возвращает число
     $DOCKER_CMD run -d --name "$CONTAINER_NAME" "${ENV_ARGS[@]}" $LOG_OPTS \
       --user $(id -u):$(id -g) \
       "${DNS_ARGS[@]}" \
-      -v "$SCRIPT_PATH":/app/yadpylesos.py -v "$BASE_DIR/apiyandex.py":/app/apiyandex.py -v "$BASE_DIR/vpn_manager.py":/app/vpn_manager.py \
-      -v "$BASE_DIR/config.yaml":/app/config.yaml:ro \
-      -v "$AUTH_DIR":/auth:ro -v "$BASE_DIR/vpn":/vpn -v "$REPORT_DIR":/report \
+      -v "$SCRIPT_PATH":/app/yadpylesos.py -v "$BASE_DIR/apicloudyandex.py":/app/apicloudyandex.py -v "$BASE_DIR/vpnmanager.py":/app/vpnmanager.py -v "$BASE_DIR/apivideo.py":/app/apivideo.py \
+      -v "$BASE_DIR/config":/config:ro -v "$BASE_DIR/cache/yt-dlp":/cache-yt \
+      -v "$AUTH_DIR":/auth -v "$BASE_DIR/vpn":/vpn -v "$REPORT_DIR":/report \
       -v "$DB_DIR":/db -v "$DEST":/download \
+      -v "$BASE_DIR/history":/history \
       -v "$THERMAL_CPU_PATH":/sys_thermal_cpu:ro \
       "$DOCKER_IMG" python3 -u /app/yadpylesos.py "${PY_ARGS[@]}"
 
@@ -391,10 +424,11 @@ run_download() {
     if [ "$AUTO_MODE" == "1" ]; then
         if [ "$BATCH_AUTO" == "1" ]; then
             local elapsed=0
+            local poll_int="${CONTAINER_POLL_INTERVAL:-10}"
             # Ждем завершения контейнера
             while $DOCKER_CMD inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null | grep -qw "true"; do
-                sleep 10
-                elapsed=$((elapsed + 10))
+                sleep "$poll_int"
+                elapsed=$((elapsed + poll_int))
                 if [ "$elapsed" -ge "$MAX_RUNTIME" ]; then
                     echo -e "${RED}[ВНИМАНИЕ]${NC} Превышен лимит времени ($MAX_RUNTIME сек). Принудительная остановка."
                     $DOCKER_CMD stop "$CONTAINER_NAME" > /dev/null 2>&1 || true
@@ -432,10 +466,9 @@ run_download() {
 
 CNAME=""; DOWNLOAD_LINK=""; DEST_FOLDER=""; CONTAINER_NAME=""
 AUTO_MODE="0"; BATCH_AUTO="0"; REFRESH_CACHE="0"; BUILD_QUEUE="0"
-AUTH_MODE="0"; AUTH_DISABLE="0"; USE_VPN="0"; HOMEOSTASIS_OFF="0"
+USE_VPN="0"; HOMEOSTASIS_OFF="0"
 SIMULATE_BAN="0"; SSL_OFF="0"; TRACE_MEM="0"; TRACE_STATUS="0"; NOTIFY_TG="0"; NUM_THREADS=1; Q_FILES=1
-MD5_TARGET=""; MOVE_EXTRA=""; TOTAL_FILES=0; VERBOSE_FLAG="0"
-BATCH_TOTAL_NUM=0; BATCH_CURRENT_NUM=0
+MD5_TARGET=""; MOVE_EXTRA=""; TOTAL_FILES=0; VERBOSE_FLAG="0"; FORCE_FLAG="0"
 
 if [ "$#" -eq 0 ] || [ "$1" == "-h" ] || [ "$1" == "--help" ]; then show_help; exit 0; fi
 
@@ -454,12 +487,25 @@ if [ "$1" == "--auth-disable" ]; then
 fi
 
 # Блок запуска служебных команд (--db-stats, --db-check, --vacuum, --auth-status)
-if [ "$1" == "--db-stats" ] || [ "$1" == "--db-check" ] || [ "$1" == "--vacuum" ] || [ "$1" == "--auth-status" ]; then
-    mkdir -p "$REPORT_DIR" "$DB_DIR"
-    $DOCKER_CMD run --rm -it -e SERVICE_MODE=1 \
-      -v "$SCRIPT_PATH":/app/yadpylesos.py -v "$BASE_DIR/apiyandex.py":/app/apiyandex.py -v "$BASE_DIR/vpn_manager.py":/app/vpn_manager.py \
-      -v "$BASE_DIR/config.yaml":/app/config.yaml:ro \
-      -v "$REPORT_DIR":/report -v "$DB_DIR":/db -v "$AUTH_DIR":/auth:ro \
+if [ "$1" == "--db-stats" ] || [ "$1" == "--db-check" ] || [ "$1" == "--vacuum" ] || [ "$1" == "--auth-status" ] || [ "$1" == "--vpn-test" ]; then
+    mkdir -p "$REPORT_DIR" "$DB_DIR" "$BASE_DIR/vpn"
+    # Пробрасываем все аргументы ("$@") и добавляем папку vpn на случай, если с --auth-status передан --vpn
+    $DOCKER_CMD run --rm -it -e SERVICE_MODE=1 "${ENV_ARGS[@]}" \
+      -v "$SCRIPT_PATH":/app/yadpylesos.py -v "$BASE_DIR/apicloudyandex.py":/app/apicloudyandex.py -v "$BASE_DIR/vpnmanager.py":/app/vpnmanager.py -v "$BASE_DIR/apivideo.py":/app/apivideo.py \
+      -v "$BASE_DIR/config":/config:ro \
+      -v "$REPORT_DIR":/report -v "$DB_DIR":/db -v "$AUTH_DIR":/auth -v "$BASE_DIR/vpn":/vpn \
+      -v "$THERMAL_CPU_PATH":/sys_thermal_cpu:ro \
+      "$DOCKER_IMG" python3 -u /app/yadpylesos.py "$@"
+    exit $?
+fi
+
+if [ "$1" == "--vpn-test" ]; then
+    mkdir -p "$REPORT_DIR" "$AUTH_DIR" "$BASE_DIR/vpn"
+    $DOCKER_CMD run --rm -it -e SERVICE_MODE=1 "${ENV_ARGS[@]}" \
+      -v "$SCRIPT_PATH":/app/yadpylesos.py -v "$BASE_DIR/apicloudyandex.py":/app/apicloudyandex.py -v "$BASE_DIR/vpnmanager.py":/app/vpnmanager.py -v "$BASE_DIR/apivideo.py":/app/apivideo.py \
+      -v "$BASE_DIR/config":/config:ro \
+      -v "$REPORT_DIR":/report -v "$AUTH_DIR":/auth -v "$BASE_DIR/vpn":/vpn \
+      -v "$THERMAL_CPU_PATH":/sys_thermal_cpu:ro \
       "$DOCKER_IMG" python3 -u /app/yadpylesos.py "$1"
     exit $?
 fi
@@ -494,19 +540,23 @@ if [ "$1" == "--batch" ] || [ "$1" == "--batch-auto" ] || [ "$1" == "--auto" ]; 
     [ "$TRACE_STATUS" == "1" ] && GLOBAL_BATCH_OPTS+=" --trace-status"
     [ "$TRACE_MEM" == "1" ] && GLOBAL_BATCH_OPTS+=" --trace-mem"
 
-    if [ ! -f "$SOURCES_TXT" ] || ! head -n 1 "$SOURCES_TXT" | grep -q "^# Имя"; then
+    if [ ! -f "$SOURCES_TXT" ]; then
         echo "# Имя | Ссылка | Папка | Файлов | Опции" > "$SOURCES_TXT"
+        echo -e "${GREEN}[INFO]${NC} Создан новый $SOURCES_TXT"
+    elif ! head -n 1 "$SOURCES_TXT" | grep -q "Имя"; then
+        echo -e "${YELLOW}[ВНИМАНИЕ]${NC} Неожиданный заголовок $SOURCES_TXT — файл НЕ перезаписан. Проверьте вручную при необходимости."
     fi
 
     if [ "$BATCH_AUTO" == "0" ]; then
         echo -e "${CYAN}=== Менеджер ссылок ===${NC}"
         $DOCKER_CMD rm -f yadpylesos-manager > /dev/null 2>&1
         $DOCKER_CMD run --rm -it --name "yadpylesos-manager" \
-          -v "$SCRIPT_PATH":/app/yadpylesos.py -v "$BASE_DIR/apiyandex.py":/app/apiyandex.py -v "$BASE_DIR/vpn_manager.py":/app/vpn_manager.py \
-          -v "$BASE_DIR/config.yaml":/app/config.yaml:ro \
-          -v "$REPORT_DIR":/report -v "$SOURCES_TXT":/app/source_links.txt \
+          -v "$SCRIPT_PATH":/app/yadpylesos.py -v "$BASE_DIR/apicloudyandex.py":/app/apicloudyandex.py -v "$BASE_DIR/vpnmanager.py":/app/vpnmanager.py -v "$BASE_DIR/apivideo.py":/app/apivideo.py \
+          -v "$BASE_DIR/config":/config:ro -v "$BASE_DIR/config/source_links.txt":/config/source_links.txt \
+          -v "$REPORT_DIR":/report \
           "$DOCKER_IMG" python3 -u /app/yadpylesos.py --manage
-        [ $? -ne 0 ] && { echo "Выход"; exit 0; }
+        run_rc=$?
+        if [ "$run_rc" -ne 0 ]; then echo "Выход"; exit 0; fi
     fi
 
     declare -a BATCH_ARRAY
@@ -532,20 +582,21 @@ if [ "$1" == "--batch" ] || [ "$1" == "--batch-auto" ] || [ "$1" == "--auto" ]; 
             total=$(echo "$line" | cut -d'|' -f4 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             opts=$(echo "$line" | cut -d'|' -f5 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             
-            REFRESH_CACHE="0"; BUILD_QUEUE="0"; AUTH_MODE="0"; AUTH_DISABLE="0"
+            REFRESH_CACHE="0"; BUILD_QUEUE="0"
             USE_VPN="0"; HOMEOSTASIS_OFF="0"; SIMULATE_BAN="0"; SSL_OFF="0"
             NUM_THREADS=1; Q_FILES=1; MD5_TARGET=""; MOVE_EXTRA=""; VERBOSE_FLAG="0"
             NOTIFY_TG="0"; TRACE_MEM="0"; TRACE_STATUS="0"
             
             # Применяем флаги из source_links.txt И глобальные флаги --batch-auto
-            if [ -n "$opts" ] || [ -n "$GLOBAL_BATCH_OPTS" ]; then 
-                eval "set -- $opts $GLOBAL_BATCH_OPTS"
-                parse_args "$@"
+            if [ -n "$opts" ] || [ -n "$GLOBAL_BATCH_OPTS" ]; then
+                read -ra _OPTS_ARRAY <<< "$opts $GLOBAL_BATCH_OPTS"
+                parse_args "${_OPTS_ARRAY[@]}"
             fi
             
             run_download "$cname" "$link" "$dest" "$total" || true
             BATCH_ARRAY[$i]="# $line"
         done
+        # shellcheck disable=SC2188  # легитимный truncate: обнулить файл списка перед перезаписью
         > "$SOURCES_TXT"
         for l in "${BATCH_ARRAY[@]}"; do echo "$l" >> "$SOURCES_TXT"; done
         bash_log "${GREEN}" "Пакетная выгрузка завершена."
@@ -554,6 +605,7 @@ if [ "$1" == "--batch" ] || [ "$1" == "--batch-auto" ] || [ "$1" == "--auto" ]; 
     if [ "$BATCH_AUTO" == "1" ]; then
         bash_log "${GREEN}" "Запуск в фоновом режиме (cron)..."
         # Очищаем файл перед стартом, а затем дописываем (>>) на каждой итерации
+        # shellcheck disable=SC2188  # легитимный truncate: обнулить лог пакета перед стартом
         > "$BATCH_LOG"
         run_batch >> "$BATCH_LOG" 2>&1 &
         echo "PID: $! | Лог: $BATCH_LOG"
@@ -568,6 +620,7 @@ if [ "$1" == "--batch" ] || [ "$1" == "--batch-auto" ] || [ "$1" == "--auto" ]; 
         disown $BATCH_PID 2>/dev/null || true
         
         # Обработчик Ctrl+C
+        # shellcheck disable=SC2317  # вся функция вызывается через trap SIGINT — shellcheck trap-вызовы не видит
         handle_ctrl_c() {
             local remaining_names=""
             local remaining_count=0
@@ -597,7 +650,7 @@ if [ "$1" == "--batch" ] || [ "$1" == "--batch-auto" ] || [ "$1" == "--auto" ]; 
             fi
             
             if [ -n "$TAIL_PID" ]; then
-                kill $TAIL_PID 2>/dev/null || true
+                kill "$TAIL_PID" 2>/dev/null || true
             fi
             exit 0
         }
